@@ -1,29 +1,27 @@
 import os
 import json
-import streamlit as st
 import time
+import av
+import queue
+import streamlit as st
 from datetime import datetime
+from typing import Optional, Dict, Any
 
-# --- Your existing imports ---
 import whisper
-import sounddevice as sd
-import numpy as np
-from scipy.io.wavfile import write
 from fpdf import FPDF, XPos, YPos
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any
 import google.generativeai as genai
+from streamlit_webrtc import webrtc_streamer, AudioProcessorBase
 
-# ---------------- CONFIG ----------------
-if "audio_path" not in st.session_state:
-    st.session_state.audio_path = None
-
+# ---------------- PAGE CONFIG ----------------
 st.set_page_config(page_title="Doctor Reporting Assistant", layout="centered")
 
 BASE_MIC_DIR = "./input_files/liv_mic"
+UPLOAD_DIR = "./input_files/uploaded"
 os.makedirs(BASE_MIC_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# ---------------- GEMINI SETUP ----------------
+# ---------------- GEMINI ----------------
 genai.configure(api_key=st.secrets["gem_key"])
 MODEL = genai.GenerativeModel("gemini-2.5-flash")
 
@@ -37,61 +35,54 @@ class DiagnosisOutput(BaseModel):
     extracted_entities: Dict[str, Any] = Field(default_factory=dict)
     raw_transcript: str
 
-# ---------------- CORE FUNCTIONS ----------------
+# ---------------- WHISPER ----------------
 @st.cache_resource
 def load_whisper():
     return whisper.load_model("base", device="cpu")
 
 def transcribe_audio(audio_path: str) -> str:
     model = load_whisper()
-    result = model.transcribe(audio_path)
-    return result["text"]
+    return model.transcribe(audio_path)["text"]
 
+# ---------------- GEMINI EXTRACTION ----------------
 def extract_with_gemini(transcript: str) -> DiagnosisOutput:
-    schema_json = json.dumps(
-        DiagnosisOutput.model_json_schema(),
-        indent=2
-    )
+    schema_json = json.dumps(DiagnosisOutput.model_json_schema(), indent=2)
 
     prompt = f"""
 You are a medical information extraction system.
 
-RULES:
-- Populate known fields if present
-- Put extra information into extracted_entities
+Rules:
 - Use null if missing
 - Do not hallucinate
-- Output strictly matching JSON schema
+- Output valid JSON only
+- Match schema exactly
 
-JSON SCHEMA:
+SCHEMA:
 {schema_json}
 
 TRANSCRIPT:
 \"\"\"{transcript}\"\"\"
-
-OUTPUT JSON ONLY:
 """
 
     response = MODEL.generate_content(prompt)
     text = response.text.replace("```json", "").replace("```", "").strip()
     data = json.loads(text)
-
     data["raw_transcript"] = transcript
     return DiagnosisOutput(**data)
 
+# ---------------- PDF ----------------
 def generate_pdf(data: DiagnosisOutput, output_path: str):
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_auto_page_break(True, 15)
 
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, "Medical Diagnosis Report",
-             new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
+    pdf.cell(0, 10, "Medical Diagnosis Report", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(5)
+
     pdf.set_font("Helvetica", size=12)
 
-    fixed_fields = [
+    fields = [
         ("Patient Name", data.patient_name),
         ("Age", data.age),
         ("Gender", data.gender),
@@ -99,9 +90,9 @@ def generate_pdf(data: DiagnosisOutput, output_path: str):
         ("Diagnosis", data.diagnosis),
     ]
 
-    for title, value in fixed_fields:
-        if value:
-            pdf.multi_cell(0, 8, f"{title}: {value}")
+    for k, v in fields:
+        if v:
+            pdf.multi_cell(0, 8, f"{k}: {v}")
             pdf.ln(1)
 
     if data.extracted_entities:
@@ -109,114 +100,83 @@ def generate_pdf(data: DiagnosisOutput, output_path: str):
         pdf.set_font("Helvetica", "B", 13)
         pdf.cell(0, 8, "Additional Clinical Details",
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
         pdf.set_font("Helvetica", size=12)
         for k, v in data.extracted_entities.items():
             pdf.multi_cell(0, 8, f"{k.replace('_',' ').title()}: {v}")
-            pdf.ln(1)
 
     pdf.output(output_path)
 
-def record_from_mic(duration_seconds: int = 30, sample_rate: int = 16000) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(BASE_MIC_DIR, f"live_recording_{timestamp}.wav")
+# ---------------- WEBRTC AUDIO ----------------
+class AudioRecorder(AudioProcessorBase):
+    def __init__(self):
+        self.frames = queue.Queue()
 
-    audio = sd.rec(
-        int(duration_seconds * sample_rate),
-        samplerate=sample_rate,
-        channels=1,
-        dtype="int16"
-    )
-    sd.wait()
-    write(path, sample_rate, audio)
+    def recv(self, frame: av.AudioFrame):
+        self.frames.put(frame)
+        return frame
 
-    return path
+    def save(self, path):
+        import soundfile as sf
+        samples = []
+        while not self.frames.empty():
+            frame = self.frames.get()
+            samples.append(frame.to_ndarray())
+        if samples:
+            audio = samples[0] if len(samples) == 1 else sum(samples)
+            sf.write(path, audio.T, 16000)
 
-# ---------------- STREAMLIT UI ----------------
+# ---------------- UI ----------------
 st.title("🩺 Doctor Reporting Assistant")
 
 mode = st.radio(
-    "Choose input method:",
+    "Choose input method",
     ["Upload Audio File", "Record Live Microphone"]
 )
 
 audio_path = None
 
+# -------- UPLOAD MODE --------
 if mode == "Upload Audio File":
     uploaded = st.file_uploader("Upload diagnosis audio", type=["wav", "mp3", "m4a"])
     if uploaded:
-        os.makedirs("./input_files/uploaded", exist_ok=True)
-        audio_path = f"./input_files/uploaded/{uploaded.name}"
+        audio_path = os.path.join(UPLOAD_DIR, uploaded.name)
         with open(audio_path, "wb") as f:
             f.write(uploaded.read())
         st.success("Audio uploaded successfully")
 
-# else:
-#     duration = st.slider("Recording duration (seconds)", 10, 120, 30)
-#     if st.button("🎙️ Start Recording"):
-#         if st.button("🎙️ Start Recording"):
-#             st.session_state.audio_path = record_from_mic(duration)
-#             st.success("Recording completed. You can now generate the report.")
-
+# -------- LIVE MIC MODE --------
 else:
-    duration = st.slider("Recording duration (seconds)", 10, 120, 30)
+    duration = st.slider("Recording duration (seconds)", 5, 60, 20)
 
-    if st.button("🎙️ Start Recording"):
-        status_text = st.empty()
-        countdown_text = st.empty()
-        progress_bar = st.progress(0)
+    st.info("🎙️ Press start, speak clearly, and wait for countdown")
 
-        status_text.warning("🔴 Recording in progress...")
+    recorder = AudioRecorder()
 
-        # Start recording in background
-        audio_frames = sd.rec(
-            int(duration * 16000),
-            samplerate=16000,
-            channels=1,
-            dtype="int16"
-        )
+    ctx = webrtc_streamer(
+        key="mic",
+        audio_processor_factory=lambda: recorder,
+        media_stream_constraints={"audio": True, "video": False},
+    )
 
-        # Countdown + progress bar
-        for remaining in range(duration, 0, -1):
-            countdown_text.info(f"⏱️ Recording... {remaining} seconds remaining")
-            progress = int(((duration - remaining + 1) / duration) * 100)
-            progress_bar.progress(progress)
+    if ctx.state.playing:
+        countdown = st.empty()
+        for i in range(duration, 0, -1):
+            countdown.markdown(f"⏱️ **Recording… {i}s remaining**")
             time.sleep(1)
+        countdown.markdown("✅ **Recording finished**")
 
-        sd.wait()
-
-        # Save audio
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(BASE_MIC_DIR, f"live_recording_{timestamp}.wav")
-        write(path, 16000, audio_frames)
+        audio_path = os.path.join(BASE_MIC_DIR, f"live_recording_{timestamp}.wav")
+        recorder.save(audio_path)
+        st.success("Recording saved")
 
-        # Update session state
-        st.session_state.audio_path = path
-
-        # Final UI update
-        progress_bar.progress(100)
-        countdown_text.empty()
-        status_text.success("✅ Recording completed. Ready to generate report.")
-
-
-        # with st.spinner("Recording..."):
-        #     audio_path = record_from_mic(duration)
-        # st.success(f"Recording saved")
-
-if st.session_state.audio_path and st.button("🧠 Generate Report"):
-    audio_path = st.session_state.audio_path
-
+# -------- PROCESS --------
+if audio_path and st.button("🧠 Generate Report"):
     with st.spinner("Transcribing audio..."):
         transcript = transcribe_audio(audio_path)
 
     st.subheader("📝 Transcript")
-    # st.text_area("", transcript, height=200)
-    st.text_area(
-        "Transcript",
-        transcript,
-        height=200,
-        label_visibility="collapsed"
-    )
+    st.text_area("Transcript", transcript, height=200)
 
     with st.spinner("Extracting information with Gemini..."):
         extracted = extract_with_gemini(transcript)
@@ -229,7 +189,7 @@ if st.session_state.audio_path and st.button("🧠 Generate Report"):
 
     with open(pdf_path, "rb") as f:
         st.download_button(
-            label="📄 Download PDF Report",
+            "📄 Download PDF",
             data=f,
             file_name=pdf_path,
             mime="application/pdf"
