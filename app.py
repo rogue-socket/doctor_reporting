@@ -24,7 +24,7 @@ BASE_MIC_DIR = "./input_files/liv_mic"
 os.makedirs(BASE_MIC_DIR, exist_ok=True)
 
 # ---------------- GEMINI SETUP ----------------
-genai.configure(api_key="AIzaSyBQc6oQAzPHxj-GEDgUnDIybQofN0Twjgo")
+genai.configure(api_key=st.secrets["gem_key"])
 MODEL = genai.GenerativeModel("gemini-2.5-flash")
 
 # ---------------- SCHEMA ----------------
