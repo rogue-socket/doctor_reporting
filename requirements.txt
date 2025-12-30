@@ -1,0 +1,8 @@
+sounddevice
+scipy
+openai-whisper
+torch
+torchaudio
+google-generativeai
+fpdf2
+streamlit
