@@ -6,3 +6,14 @@ torchaudio
 google-generativeai
 fpdf2
 streamlit
+
+streamlit
+streamlit-webrtc
+openai-whisper
+torch
+numpy
+soundfile
+fpdf2
+pydantic>=2
+google-genai
+av
